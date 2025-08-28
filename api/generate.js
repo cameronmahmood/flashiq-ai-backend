@@ -1,51 +1,77 @@
 // api/generate.js
-export default async function handler(req, res) {
-  // --- CORS: allow your site to call this API ---
+// POST { text: string } -> { cards: [{front, back}, ...] }
+// Uses OpenAI to turn notes into flashcards.
+
+export const runtime = "nodejs";
+
+const CORS_ALLOW = [
+  "https://cameronmahmood.github.io",
+  "http://localhost:8080",
+  "http://localhost:5173",
+  "http://127.0.0.1:8080",
+];
+
+function setCors(req, res) {
   const origin = req.headers.origin || "";
-  const allow = ["https://cameronmahmood.github.io", "http://localhost:8000"];
-  if (allow.includes(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
+  if (CORS_ALLOW.includes(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.status(200).end();
+}
 
+export default async function handler(req, res) {
+  setCors(req, res);
+  if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
-  // Parse body safely
-  let body = req.body;
-  if (typeof body === "string") { try { body = JSON.parse(body); } catch {} }
-  const { text } = body || {};
-  if (!text || text.length < 10) return res.status(400).json({ error: "No text" });
-
   try {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) return res.status(500).json({ error: "Missing OPENAI_API_KEY" });
+
+    // Safely parse body
+    let body = req.body;
+    if (typeof body === "string") try { body = JSON.parse(body); } catch {}
+    const text = (body?.text || "").trim();
+    if (!text) return res.status(400).json({ error: "No text" });
+
+    const prompt = `
+Turn the following notes into concise flashcards.
+Return JSON with the shape:
+{ "cards": [ { "front": "Q or term", "back": "answer" }, ... ] }
+Keep cards short and specific. 8–15 cards max.
+
+NOTES:
+${text}
+`.trim();
+
     const resp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
-      },
+      headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         model: "gpt-4o-mini",
-        temperature: 0.2,
-        messages: [
-          { role: "system", content:
-            "Turn study notes into concise flashcards. Reply ONLY with a JSON array: [{\"front\":\"...\",\"back\":\"...\"}]. No prose, no code fences." },
-          { role: "user", content:
-            `Create 6–15 college-level flashcards. Keep each front/back short and precise.\nNotes:\n${text}` }
-        ]
+        response_format: { type: "json_object" },
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.2
       })
     });
 
-    const data = await resp.json();
-    let content = data?.choices?.[0]?.message?.content || "[]";
-    content = content.replace(/```json|```/g, "").trim(); // strip code fences if present
-    let cards = [];
-    try { cards = JSON.parse(content); } catch {}
-    cards = (cards || []).filter(c => c?.front && c?.back).slice(0, 20);
+    const json = await resp.json();
+    if (!resp.ok) {
+      return res.status(resp.status).json({ error: json?.error?.message || "OpenAI error", raw: json });
+    }
 
-    return res.status(200).json({ cards });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "AI error" });
+    // Parse assistant JSON
+    let data;
+    try {
+      data = JSON.parse(json.choices?.[0]?.message?.content || "{}");
+    } catch (e) {
+      return res.status(502).json({ error: "Bad JSON from model", raw: json });
+    }
+
+    const cards = Array.isArray(data?.cards) ? data.cards.filter(c => c?.front && c?.back) : [];
+    return res.json({ cards });
+  } catch (e) {
+    console.error("GENERATE_ERR:", e);
+    return res.status(500).json({ error: String(e?.message || e) });
   }
 }
