@@ -2,13 +2,11 @@
   "name": "flashiq-ai-backend",
   "type": "module",
   "private": true
-}
-
-{
-  "dependencies": {
+"dependencies": {
     "busboy": "^1.6.0",
     "pdf-parse": "^1.1.1",
     "pptx-parser": "^1.4.0",
     "openai": "^4.58.1"
   }
 }
+
