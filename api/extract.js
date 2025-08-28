@@ -57,24 +57,40 @@ function parseMultipart(req) {
 }
 
 // ---- Simple PPTX text extractor (reads slide XMLs) ----
+function unescapeXML(str = "") {
+  return str
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
 function extractTextFromPptx(buffer) {
   const zip = new AdmZip(buffer);
   const entries = zip.getEntries();
+
   // collect slide XML files: ppt/slides/slide1.xml, slide2.xml, ...
   const slideEntries = entries
-    .filter(e => /^ppt\/slides\/slide\d+\.xml$/.test(e.entryName))
+    .filter((e) => /^ppt\/slides\/slide\d+\.xml$/.test(e.entryName))
     .sort((a, b) => {
       const na = parseInt(a.entryName.match(/slide(\d+)\.xml/)?.[1] || "0", 10);
       const nb = parseInt(b.entryName.match(/slide(\d+)\.xml/)?.[1] || "0", 10);
       return na - nb;
     });
-  let all = [];
+
+  const all = [];
   for (const e of slideEntries) {
     const xml = e.getData().toString("utf8");
-    // text in PPTX slides is usually inside <a:t> ... </a:t>
-    const matches = [...xml.matchAll(/<a:t>(.*?)<\/a:t>/g)];
-    const slideText = matches.map(m => m[1]).join(" ");
-    if (slideText.trim()) all.push(slideText);
+
+    // grab text in <a:t>…</a:t>
+    const textRuns = [...xml.matchAll(/<a:t>([\s\S]*?)<\/a:t>/g)].map((m) =>
+      unescapeXML(m[1]).replace(/\s+/g, " ").trim()
+    );
+
+    // convert explicit line breaks <a:br/> to newlines (approx by splitting shapes)
+    const slideText = textRuns.join(" ").trim();
+    if (slideText) all.push(slideText);
   }
   return all.join("\n\n");
 }
@@ -89,8 +105,8 @@ async function ocrWithOpenAI(buffer, mimeType) {
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
     },
     body: JSON.stringify({
       model: "gpt-4o-mini",
@@ -98,14 +114,19 @@ async function ocrWithOpenAI(buffer, mimeType) {
         {
           role: "user",
           content: [
-            { type: "text", text: "Extract legible text from this image. If handwritten, transcribe it as best as possible." },
-            { type: "image_url", image_url: { url: dataUrl } }
-          ]
-        }
+            {
+              type: "text",
+              text:
+                "Extract legible text from this image. If handwritten, transcribe it as best as possible.",
+            },
+            { type: "image_url", image_url: { url: dataUrl } },
+          ],
+        },
       ],
-      temperature: 0.2
-    })
+      temperature: 0.2,
+    }),
   });
+
   const json = await resp.json();
   if (!resp.ok) {
     throw new Error(json?.error?.message || "OpenAI OCR error");
@@ -121,18 +142,20 @@ function isPdf(mt, name) {
 }
 function isPptx(mt, name) {
   return (
-    mt === "application/vnd.openxmlformats-officedocument.presentationml.presentation" ||
+    mt ===
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation" ||
     /\.pptx$/i.test(name)
   );
 }
 function isText(mt, name) {
-  return mt.startsWith("text/") || /\.txt$/i.test(name);
+  return mt?.startsWith?.("text/") || /\.txt$/i.test(name);
 }
 
 export default async function handler(req, res) {
   setCors(req, res);
   if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
+  if (req.method !== "POST")
+    return res.status(405).json({ error: "POST only" });
 
   try {
     const { files } = await parseMultipart(req);
@@ -147,7 +170,7 @@ export default async function handler(req, res) {
           text = (parsed.text || "").trim();
         } else if (isPptx(f.mimeType, f.filename)) {
           text = extractTextFromPptx(f.buffer);
-          // If we somehow got nothing, keep text="" and let OCR try
+          // If we somehow got nothing, keep text="" and let OCR try as fallback
         } else if (isText(f.mimeType, f.filename)) {
           text = f.buffer.toString("utf8");
         }
@@ -159,7 +182,7 @@ export default async function handler(req, res) {
 
         // As a super-safe fallback, try OCR for anything that yielded no text
         if (!text.trim() && !isImageType(f.mimeType)) {
-          // JPEG OCR tends to do best—but we can pass original mime
+          // Use a common mime that Vision accepts if we don't have an image
           text = await ocrWithOpenAI(f.buffer, "image/jpeg");
         }
       } catch (err) {
