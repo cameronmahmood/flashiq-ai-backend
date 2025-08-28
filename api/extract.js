@@ -1,36 +1,28 @@
 // api/extract.js
-// Upload one or more files and get back extracted text.
-// Supports: PDF, PPTX (unzip + read slide XML), images (OCR with OpenAI Vision), TXT.
-// Env: OPENAI_API_KEY (Vercel Project Settings → Environment Variables)
-
 export const runtime = "nodejs";
 export const config = { api: { bodyParser: false } };
 
-// ---- Imports ----
 import Busboy from "busboy";
 import pdfParse from "pdf-parse";
 import AdmZip from "adm-zip";
 
-// ====== CONFIG ======
+// ---- CORS ----
 const CORS_ALLOW = [
   "https://cameronmahmood.github.io",
+  "https://cameronmahmood.github.io/flashiq",
   "http://localhost:8080",
   "http://localhost:5173",
   "http://127.0.0.1:8080",
 ];
-
-// helper: set CORS headers
 function setCors(req, res) {
   const origin = req.headers.origin || "";
-  if (CORS_ALLOW.includes(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  }
+  if (CORS_ALLOW.includes(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-// ---- Parse multipart using Busboy into memory ----
+// ---- multipart to memory ----
 function parseMultipart(req) {
   return new Promise((resolve, reject) => {
     const bb = Busboy({ headers: req.headers });
@@ -38,124 +30,101 @@ function parseMultipart(req) {
     const fields = {};
     bb.on("file", (name, file, info) => {
       const chunks = [];
-      const { filename, mimeType } = info;
-      file.on("data", (d) => chunks.push(d));
-      file.on("end", () => {
-        files.push({
-          fieldname: name,
-          filename: filename || "unnamed",
-          mimeType: mimeType || "application/octet-stream",
-          buffer: Buffer.concat(chunks),
-        });
-      });
+      const { filename, mimeType } = info || {};
+      file.on("data", d => chunks.push(d));
+      file.on("end", () => files.push({
+        fieldname: name,
+        filename: filename || "unnamed",
+        mimeType: mimeType || "application/octet-stream",
+        buffer: Buffer.concat(chunks),
+      }));
     });
-    bb.on("field", (name, val) => { fields[name] = val; });
+    bb.on("field", (n, v) => fields[n] = v);
     bb.on("error", reject);
     bb.on("close", () => resolve({ files, fields }));
     req.pipe(bb);
   });
 }
 
-// ---- Simple PPTX text extractor (reads slide XMLs) ----
-function unescapeXML(str = "") {
-  return str
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
+// ---- helpers: file type ----
+const isImage = mt => /^image\//i.test(mt);
+const isPdf   = (mt, name) => mt === "application/pdf" || /\.pdf$/i.test(name);
+const isPptx  = (mt, name) =>
+  mt === "application/vnd.openxmlformats-officedocument.presentationml.presentation" || /\.pptx$/i.test(name);
+const isTxt   = (mt, name) => (mt || "").startsWith("text/") || /\.txt$/i.test(name);
+
+// ---- OCR with OpenAI Vision ----
+async function ocrWithOpenAI(buf, mime = "image/jpeg") {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
+  const b64 = buf.toString("base64");
+  const url = `data:${mime};base64,${b64}`;
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "Extract legible text from this image. If handwritten, transcribe it." },
+          { type: "image_url", image_url: { url } }
+        ]
+      }]
+    })
+  });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j?.error?.message || "OpenAI OCR error");
+  return (j.choices?.[0]?.message?.content || "").trim();
 }
 
-function extractTextFromPptx(buffer) {
+// ---- PPTX: read text from slide XMLs + OCR images in ppt/media ----
+async function extractFromPptx(buffer) {
   const zip = new AdmZip(buffer);
   const entries = zip.getEntries();
 
-  // collect slide XML files: ppt/slides/slide1.xml, slide2.xml, ...
-  const slideEntries = entries
-    .filter((e) => /^ppt\/slides\/slide\d+\.xml$/.test(e.entryName))
+  // 1) Text from slides XML
+  const slides = entries
+    .filter(e => /^ppt\/slides\/slide\d+\.xml$/.test(e.entryName))
     .sort((a, b) => {
       const na = parseInt(a.entryName.match(/slide(\d+)\.xml/)?.[1] || "0", 10);
       const nb = parseInt(b.entryName.match(/slide(\d+)\.xml/)?.[1] || "0", 10);
       return na - nb;
     });
 
-  const all = [];
-  for (const e of slideEntries) {
+  const pieces = [];
+  for (const e of slides) {
     const xml = e.getData().toString("utf8");
-
-    // grab text in <a:t>…</a:t>
-    const textRuns = [...xml.matchAll(/<a:t>([\s\S]*?)<\/a:t>/g)].map((m) =>
-      unescapeXML(m[1]).replace(/\s+/g, " ").trim()
-    );
-
-    // convert explicit line breaks <a:br/> to newlines (approx by splitting shapes)
-    const slideText = textRuns.join(" ").trim();
-    if (slideText) all.push(slideText);
+    const matches = [...xml.matchAll(/<a:t>(.*?)<\/a:t>/g)];
+    const text = matches.map(m => m[1]).join(" ").trim();
+    if (text) pieces.push(text);
   }
-  return all.join("\n\n");
-}
 
-// ---- OCR using OpenAI Vision for images / fallback ----
-async function ocrWithOpenAI(buffer, mimeType) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
-  const b64 = buffer.toString("base64");
-  const dataUrl = `data:${mimeType};base64,${b64}`;
-
-  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text:
-                "Extract legible text from this image. If handwritten, transcribe it as best as possible.",
-            },
-            { type: "image_url", image_url: { url: dataUrl } },
-          ],
-        },
-      ],
-      temperature: 0.2,
-    }),
-  });
-
-  const json = await resp.json();
-  if (!resp.ok) {
-    throw new Error(json?.error?.message || "OpenAI OCR error");
+  // 2) OCR images if present
+  const mediaImages = entries.filter(e => /^ppt\/media\/.+\.(png|jpe?g|webp)$/i.test(e.entryName));
+  for (const img of mediaImages) {
+    const buf = img.getData();
+    try {
+      const t = await ocrWithOpenAI(buf, guessMimeFromName(img.entryName));
+      if (t) pieces.push(t);
+    } catch (_) { /* ignore single image errors */ }
   }
-  return json.choices?.[0]?.message?.content?.trim() || "";
+
+  return pieces.join("\n\n");
 }
 
-function isImageType(mt) {
-  return /^image\//i.test(mt);
-}
-function isPdf(mt, name) {
-  return mt === "application/pdf" || /\.pdf$/i.test(name);
-}
-function isPptx(mt, name) {
-  return (
-    mt ===
-      "application/vnd.openxmlformats-officedocument.presentationml.presentation" ||
-    /\.pptx$/i.test(name)
-  );
-}
-function isText(mt, name) {
-  return mt?.startsWith?.("text/") || /\.txt$/i.test(name);
+function guessMimeFromName(name) {
+  if (/\.png$/i.test(name)) return "image/png";
+  if (/\.jpe?g$/i.test(name)) return "image/jpeg";
+  if (/\.webp$/i.test(name)) return "image/webp";
+  return "image/jpeg";
 }
 
 export default async function handler(req, res) {
   setCors(req, res);
   if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST")
-    return res.status(405).json({ error: "POST only" });
+  if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
   try {
     const { files } = await parseMultipart(req);
@@ -163,37 +132,33 @@ export default async function handler(req, res) {
 
     const results = [];
     for (const f of files) {
-      let text = "";
       try {
+        let text = "";
+
         if (isPdf(f.mimeType, f.filename)) {
           const parsed = await pdfParse(f.buffer);
           text = (parsed.text || "").trim();
-        } else if (isPptx(f.mimeType, f.filename)) {
-          text = extractTextFromPptx(f.buffer);
-          // If we somehow got nothing, keep text="" and let OCR try as fallback
-        } else if (isText(f.mimeType, f.filename)) {
-          text = f.buffer.toString("utf8");
-        }
 
-        if (!text.trim() && isImageType(f.mimeType)) {
-          // OCR images with OpenAI Vision
+        } else if (isPptx(f.mimeType, f.filename)) {
+          text = (await extractFromPptx(f.buffer)).trim();
+
+        } else if (isTxt(f.mimeType, f.filename)) {
+          text = f.buffer.toString("utf8");
+
+        } else if (isImage(f.mimeType)) {
           text = await ocrWithOpenAI(f.buffer, f.mimeType);
         }
 
-        // As a super-safe fallback, try OCR for anything that yielded no text
-        if (!text.trim() && !isImageType(f.mimeType)) {
-          // Use a common mime that Vision accepts if we don't have an image
+        // Ultimate fallback: OCR anything that yielded nothing
+        if (!text.trim()) {
           text = await ocrWithOpenAI(f.buffer, "image/jpeg");
         }
+
+        if (text.trim()) results.push({ file: f.filename, ok: true, text });
+        else results.push({ file: f.filename, ok: false, error: "No extractable text found" });
+
       } catch (err) {
         results.push({ file: f.filename, ok: false, error: String(err.message || err) });
-        continue;
-      }
-
-      if (!text.trim()) {
-        results.push({ file: f.filename, ok: false, error: "No extractable text found" });
-      } else {
-        results.push({ file: f.filename, ok: true, text });
       }
     }
 
