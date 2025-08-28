@@ -1,6 +1,6 @@
-// api/generate.js  — Vercel Serverless Function
+// api/generate.js
 export default async function handler(req, res) {
-  // Allow your site to call this (CORS)
+  // --- CORS: allow your site to call this API ---
   const origin = req.headers.origin || "";
   const allow = ["https://cameronmahmood.github.io", "http://localhost:8000"];
   if (allow.includes(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
@@ -8,16 +8,16 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.status(200).end();
+
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
-  // Parse JSON body safely
+  // Parse body safely
   let body = req.body;
   if (typeof body === "string") { try { body = JSON.parse(body); } catch {} }
   const { text } = body || {};
   if (!text || text.length < 10) return res.status(400).json({ error: "No text" });
 
   try {
-    // Call OpenAI
     const resp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -29,9 +29,9 @@ export default async function handler(req, res) {
         temperature: 0.2,
         messages: [
           { role: "system", content:
-            "Turn study notes into concise flashcards. Reply ONLY with a JSON array: [{\"front\":\"...\",\"back\":\"...\"}] — no prose, no code fences." },
+            "Turn study notes into concise flashcards. Reply ONLY with a JSON array: [{\"front\":\"...\",\"back\":\"...\"}]. No prose, no code fences." },
           { role: "user", content:
-            `Create 6–15 college-level flashcards from these notes. Keep each front/back short and precise.\nNotes:\n${text}` }
+            `Create 6–15 college-level flashcards. Keep each front/back short and precise.\nNotes:\n${text}` }
         ]
       })
     });
